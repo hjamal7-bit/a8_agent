@@ -1,0 +1,10 @@
+setup.py
+a8_agent/__init__.py
+a8_agent/cadence_draft_handler.py
+a8_agent.egg-info/PKG-INFO
+a8_agent.egg-info/SOURCES.txt
+a8_agent.egg-info/dependency_links.txt
+a8_agent.egg-info/requires.txt
+a8_agent.egg-info/top_level.txt
+a8_agent/web/__init__.py
+a8_agent/web/app.py

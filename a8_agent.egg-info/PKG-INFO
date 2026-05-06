@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: a8_agent
+Version: 0.1.0
+Summary: A8 cadence draft generation and orchestration
+Author: Jamal
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.104
+Requires-Dist: uvicorn[standard]>=0.24
+Requires-Dist: asyncpg>=0.29
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: psycopg2-binary>=2.9
+Requires-Dist: pydantic>=2.5
+Requires-Dist: python-dotenv>=1.0
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
