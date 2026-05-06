@@ -7,3 +7,8 @@ pydantic>=2.5
 python-dotenv>=1.0
 click>=8.0
 httpx>=0.25
+
+[dev]
+pytest>=7.0
+pytest-asyncio>=0.23
+pytest-cov>=4.1

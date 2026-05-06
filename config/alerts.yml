@@ -1,0 +1,55 @@
+groups:
+  - name: a8_agent_alerts
+    interval: 1m
+    rules:
+      # Alert: a8_agent service is down (no metrics for 1 minute)
+      - alert: A8AgentServiceDown
+        expr: up{job="a8-agent"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: a8_agent
+        annotations:
+          summary: "a8_agent service is down"
+          description: "a8_agent on {{ .Labels.instance }} has not responded for more than 1 minute. The service may have crashed or stopped responding."
+          runbook: "https://github.com/hjamal7-bit/a8_agent/blob/main/RUNBOOK.md#service-not-responding"
+
+      # Alert: High error rate (>5% in 5 minutes)
+      - alert: A8AgentHighErrorRate
+        expr: |
+          (
+            rate(drafts_failed_total[5m]) / (rate(drafts_generated_total[5m]) + rate(drafts_failed_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: a8_agent
+        annotations:
+          summary: "a8_agent high error rate detected"
+          description: "a8_agent on {{ .Labels.instance }} has an error rate above 5% over the last 5 minutes. Current rate: {{ .Value | humanizePercentage }}. Check logs for details."
+          runbook: "https://github.com/hjamal7-bit/a8_agent/blob/main/RUNBOOK.md#high-error-rate"
+
+      # Alert: Draft generation latency p95 > 2 seconds
+      - alert: A8AgentHighLatency
+        expr: |
+          histogram_quantile(0.95, rate(draft_generation_latency_ms_bucket[5m])) > 2000
+        for: 5m
+        labels:
+          severity: warning
+          service: a8_agent
+        annotations:
+          summary: "a8_agent draft generation latency is high"
+          description: "a8_agent on {{ .Labels.instance }} has p95 draft generation latency above 2 seconds. Current latency: {{ .Value | humanizeDuration }}. Check database and CRM API performance."
+          runbook: "https://github.com/hjamal7-bit/a8_agent/blob/main/RUNBOOK.md#high-latency"
+
+      # Alert: Database connection failures
+      - alert: A8AgentDatabaseError
+        expr: rate(cadence_db_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: a8_agent
+        annotations:
+          summary: "a8_agent database errors detected"
+          description: "a8_agent on {{ .Labels.instance }} is experiencing database errors. Error rate: {{ .Value | humanize }} errors/sec over last 5m. Check database connectivity and connection pool."
+          runbook: "https://github.com/hjamal7-bit/a8_agent/blob/main/RUNBOOK.md#database-connection-failed"

@@ -18,15 +18,17 @@ def event_loop():
 @pytest.fixture
 def mock_db_pool():
     """Mock asyncpg connection pool."""
-    pool = AsyncMock()
+    from contextlib import asynccontextmanager
     
-    # Mock acquire as async context manager
+    pool = MagicMock()
     conn = AsyncMock()
-    pool.acquire = MagicMock(return_value=conn)
-    conn.__aenter__ = AsyncMock(return_value=conn)
-    conn.__aexit__ = AsyncMock(return_value=None)
     
-    pool.pool_conn = conn
+    @asynccontextmanager
+    async def mock_acquire():
+        yield conn
+    
+    pool.acquire = mock_acquire
+    pool.pool_conn = conn  # For test access
     return pool
 
 

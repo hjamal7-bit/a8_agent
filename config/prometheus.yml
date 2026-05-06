@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'a8-agent-monitor'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - 'alertmanager:9093'
+
+# Load rules for evaluation at startup
+rule_files:
+  - 'alerts.yml'
+  # - 'second_rules.yml'
+
+scrape_configs:
+  - job_name: 'a8-agent'
+    metrics_path: '/metrics/prometheus'
+    scheme: http
+    scrape_interval: 15s
+    scrape_timeout: 5s
+    static_configs:
+      - targets: ['localhost:8788']
+        labels:
+          service: 'a8_agent'
+          environment: 'local'
