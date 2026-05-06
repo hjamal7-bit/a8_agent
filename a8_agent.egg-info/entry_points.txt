@@ -1,0 +1,2 @@
+[console_scripts]
+a8_cadence = a8_agent.cli:cli

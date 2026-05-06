@@ -11,6 +11,8 @@ Requires-Dist: sqlalchemy>=2.0
 Requires-Dist: psycopg2-binary>=2.9
 Requires-Dist: pydantic>=2.5
 Requires-Dist: python-dotenv>=1.0
+Requires-Dist: click>=8.0
+Requires-Dist: httpx>=0.25
 Dynamic: author
 Dynamic: requires-dist
 Dynamic: requires-python

@@ -15,5 +15,12 @@ setup(
         "psycopg2-binary>=2.9",
         "pydantic>=2.5",
         "python-dotenv>=1.0",
+        "click>=8.0",
+        "httpx>=0.25",
     ],
+    entry_points={
+        "console_scripts": [
+            "a8_cadence=a8_agent.cli:cli",
+        ],
+    },
 )
