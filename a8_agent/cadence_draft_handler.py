@@ -12,12 +12,15 @@ INTEGRATION:
 """
 
 import asyncio
+import time
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 
 import asyncpg
 from fastapi import APIRouter, HTTPException
+
+from a8_agent.metrics import metrics_collector
 
 router = APIRouter(tags=["cadence"])
 
@@ -92,6 +95,7 @@ class CadenceDraftGenerator:
         if not self.pool:
             raise RuntimeError("CadenceDraftGenerator not initialized")
 
+        start_time = time.time()
         async with self.pool.acquire() as conn:
             try:
                 # Get cadence instance and template
@@ -167,14 +171,19 @@ class CadenceDraftGenerator:
                     )
 
                     drafted_ids.append(draft_id)
+                    metrics_collector.record_draft_generated()
 
+                metrics_collector.record_cadence_enrollment()
+                latency_ms = (time.time() - start_time) * 1000
                 return {
                     "generated": drafted_ids,
                     "skipped": len(touches) - len(drafted_ids),
                     "error": None,
+                    "latency_ms": latency_ms,
                 }
 
             except Exception as e:
+                metrics_collector.record_error("generate_for_enrollment")
                 return {"error": str(e), "generated": [], "skipped": 0}
 
     async def regenerate_for_template(self, template_id: str, force: bool = False) -> dict:

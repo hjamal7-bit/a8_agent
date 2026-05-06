@@ -18,6 +18,13 @@ setup(
         "click>=8.0",
         "httpx>=0.25",
     ],
+    extras_require={
+        "dev": [
+            "pytest>=7.0",
+            "pytest-asyncio>=0.23",
+            "pytest-cov>=4.1",
+        ],
+    },
     entry_points={
         "console_scripts": [
             "a8_cadence=a8_agent.cli:cli",

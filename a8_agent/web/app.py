@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import os
 from fastapi import FastAPI
 from a8_agent.cadence_draft_handler import cadence_lifespan, router as cadence_router
+from a8_agent.metrics import setup_metrics_routes
 
 
 @asynccontextmanager
@@ -34,6 +35,9 @@ def create_app() -> FastAPI:
     
     # Include cadence router
     app.include_router(cadence_router, prefix="/cadence")
+    
+    # Setup metrics endpoints
+    setup_metrics_routes(app)
     
     # Health check
     @app.get("/health")
