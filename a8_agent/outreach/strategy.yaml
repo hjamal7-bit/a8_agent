@@ -1,0 +1,302 @@
+# =============================================================================
+# Cold outreach strategy matrix — 2 pillars × 4 archetypes = 8 cells.
+#
+# DESIGN PRINCIPLE
+# ----------------
+# Every draft is two sentences plus an ask, structured as:
+#
+#   1. THESIS — names the specific fact AND states why that fact is the
+#               reason to talk *now*, to *this* person. The fact must be
+#               causally load-bearing: if you delete it, the email collapses.
+#               No fact-then-pivot. No research-flexing.
+#
+#   2. ASK    — the direct investment ask.
+#
+# A variant whose thesis just names a fact and pivots to "we invest in X
+# businesses" is wrong by construction. Don't add those.
+#
+# CONTRACT
+# --------
+# Every cell defines:
+#   subject_variants : list of {slots:[...], text: "..."} — first whose slots
+#                      all resolve wins.
+#   thesis_variants  : list of {slots:[...], text: "..."} — same selection rule.
+#                      MUST contain a specific profile reference AND state why
+#                      that reference is the reason for writing.
+#   ask_variants     : the direct investment ask. May or may not have slots.
+#   fallback         : single safe variant requiring only first_name + company.
+#                      Used when no full variant resolves.
+#
+# VOICE GUARDRAILS (enforced in guardrails.py, not just guidance)
+# ---------------
+#   - Max 4 sentences total. Subject ≤ 60 chars.
+#   - Banned: synergy, value-add, leverage, optimize, ecosystem, robust,
+#     world-class, hope this finds you well, touching base, circle back,
+#     unlock value, holistic, paradigm, best-in-class, mission-critical,
+#     thought leader, deep dive, going forward, at scale.
+#   - Banned-by-interpretation (caught at write-time, not in YAML): no
+#     mind-reading phrases like "looks like X is coming," "ahead of something,"
+#     "sounds like you're planning." Reference signals — don't interpret them.
+# =============================================================================
+
+# Used only if even the cell-level fallback can't resolve (no first_name AND
+# no company). Plain, human, signs off without a specific hook.
+global_fallback:
+  subject: "quick question"
+  body: |
+    Came across your name on the investor side. We write checks into companies in your space and wanted to see if you'd be open to a short call about us putting money in.
+
+    Worth 15 minutes?
+
+# -----------------------------------------------------------------------------
+pillars:
+
+  ip_rich:
+    label: "IP-Rich Firms"
+    description: "Software, proprietary tech, unique manufacturing, patents."
+
+    archetypes:
+
+      founder_bootstrapped:
+        label: "Founder / Bootstrapped"
+        subject_variants:
+          - slots: [company]
+            text: "investing in {company}"
+          - slots: [first_name]
+            text: "{first_name} — investment ask"
+        thesis_variants:
+          # The IP itself, built without outside capital, IS the thesis.
+          - slots: [first_name, company, ip_signal]
+            text: |
+              {first_name}, most companies in your space talk about proprietary tech and don't have any — you actually built and shipped {ip_signal} at {company} without taking outside money, and that's exactly the profile we write checks into.
+          # Without a specific IP signal but with sector context, the founder-
+          # without-capital pattern is the thesis.
+          - slots: [first_name, company, sector]
+            text: |
+              {first_name}, building real tech in {sector} without outside capital is the hardest version of the job, and {company} is the kind of company we'd want to put money into precisely because you did it that way.
+        ask_variants:
+          - slots: []
+            text: "Open to 20 minutes about us writing a check?"
+          - slots: []
+            text: "Worth a call about an investment?"
+        fallback:
+          slots: [first_name, company]
+          subject: "investing in {company}"
+          body: |
+            {first_name}, founder-built tech companies are the only kind we write checks into, and {company} is on a short list for us.
+
+            Worth a call about an investment?
+
+      corporate_executive:
+        label: "Corporate Executive"
+        subject_variants:
+          - slots: [company]
+            text: "investing in {company}"
+          - slots: [first_name]
+            text: "{first_name} — investment ask"
+        thesis_variants:
+          # The contact's arrival at this specific kind of company IS the
+          # trigger. We're reaching out NOW because of WHO is now there.
+          - slots: [first_name, company, prior_employer]
+            text: |
+              {first_name}, when an operator who ran {prior_employer} ends up at a proprietary-tech company like {company}, that's usually the moment a quiet investor like us tries to get in the room — and we'd like to put money in.
+          # Without a prior-employer signal, the metric becomes the thesis.
+          - slots: [first_name, company, metric_signal]
+            text: |
+              {first_name}, {metric_signal} at a proprietary-tech company is rare enough that {company} ends up on the short list of companies we'd actually write a check into.
+        ask_variants:
+          - slots: []
+            text: "Worth 20 minutes?"
+          - slots: []
+            text: "Open to a quick call?"
+        fallback:
+          slots: [first_name, company]
+          subject: "{company}"
+          body: |
+            {first_name}, {company} is the kind of proprietary-tech company we'd want to back the operating team at — not replace it.
+
+            Worth a call about us putting capital in?
+
+      pe_owned:
+        label: "PE-Owned Portfolio Leadership"
+        subject_variants:
+          - slots: [company]
+            text: "{company} — before the process"
+          - slots: [first_name]
+            text: "{first_name} — investment ask"
+        thesis_variants:
+          # The sponsor's hold-period clock IS the timing thesis.
+          - slots: [first_name, company, pe_sponsor]
+            text: |
+              {first_name}, the {pe_sponsor} hold on {company} is probably in its back half, and IP-rich companies in your space are the only kind we write secondary checks into — we'd rather have the conversation before any bank is involved.
+          # Without an explicit sponsor name, the "next chapter" frame
+          # still works as the thesis.
+          - slots: [first_name, company]
+            text: |
+              {first_name}, {company} is the kind of proprietary-tech company we want to be the next investor in, and those conversations almost always go better before a process is running.
+        ask_variants:
+          - slots: []
+            text: "Open to a quiet 20-minute call?"
+          - slots: []
+            text: "Worth a call ahead of anything formal?"
+        fallback:
+          slots: [first_name, company]
+          subject: "{company}"
+          body: |
+            {first_name}, {company} is on a short list of IP-rich companies we want to be the next investor in.
+
+            Open to a quiet call before any process kicks off?
+
+      generational_family:
+        label: "Generational / Family Ownership"
+        subject_variants:
+          - slots: [company]
+            text: "{company}"
+          - slots: [first_name]
+            text: "{first_name} — a thought"
+        thesis_variants:
+          # The COMBINATION of proprietary tech AND long family tenure IS
+          # the thesis — it's the rarest pairing in the market.
+          - slots: [first_name, company, family_signal]
+            text: |
+              {first_name}, {family_signal} of family ownership at a proprietary-tech company like {company} is the rarest combination we look for — patient capital, long hold, no flip — and we'd like to put money in on those terms.
+          - slots: [first_name, company]
+            text: |
+              {first_name}, family-held proprietary-tech companies like {company} are the only kind we hold for the long run, and we'd like to back yours rather than someone who'd flip it.
+        ask_variants:
+          - slots: []
+            text: "Open to a quiet call?"
+          - slots: []
+            text: "Worth a call to see if we'd be the right partner?"
+        fallback:
+          slots: [first_name, company]
+          subject: "{company}"
+          body: |
+            {first_name}, family-held proprietary-tech companies are the only kind we hold for the long run, and {company} is one we'd want to back.
+
+            Open to a quiet call about us putting capital in?
+
+  distribution_heavy:
+    label: "Distribution-Heavy Firms"
+    description: "Logistics, supply chain, regional market dominance, multi-unit."
+
+    archetypes:
+
+      founder_bootstrapped:
+        label: "Founder / Bootstrapped"
+        subject_variants:
+          - slots: [company]
+            text: "investing in {company}"
+          - slots: [first_name]
+            text: "{first_name} — investment ask"
+        thesis_variants:
+          # Regional density built without capital IS the thesis. It can't be
+          # recreated, which is exactly why we'd pay for it.
+          - slots: [first_name, company, region]
+            text: |
+              {first_name}, the density you've built around {region} at {company} isn't something anyone can recreate with capital — that's exactly the kind of company we want to write a check into.
+          - slots: [first_name, company]
+            text: |
+              {first_name}, what you've put together on the ground at {company} without outside money is the moat most investors don't see — and it's exactly why we'd want to be your investor.
+        ask_variants:
+          - slots: []
+            text: "Open to 20 minutes about us writing a check?"
+          - slots: []
+            text: "Worth a call about an investment?"
+        fallback:
+          slots: [first_name, company]
+          subject: "investing in {company}"
+          body: |
+            {first_name}, founder-built regional businesses are the only kind we write checks into, and {company} is on a short list for us.
+
+            Worth a call?
+
+      corporate_executive:
+        label: "Corporate Executive"
+        subject_variants:
+          - slots: [company]
+            text: "investing in {company}"
+          - slots: [first_name]
+            text: "{first_name} — investment ask"
+        thesis_variants:
+          # The operator's arrival at a multi-unit company IS the trigger.
+          - slots: [first_name, company, prior_employer]
+            text: |
+              {first_name}, when an operator who ran {prior_employer} ends up at a multi-unit company like {company}, that's usually the moment a quiet investor like us tries to get in the room — and we'd like to put money in.
+          - slots: [first_name, company, metric_signal]
+            text: |
+              {first_name}, {metric_signal} at a multi-unit company is unusual enough that {company} ended up on the short list of companies we'd actually want to invest behind.
+          # Hired-CEO-at-founder-shop: be explicit about backing the operator
+          # the founder chose, without claiming he built the place.
+          - slots: [first_name, company]
+            text: |
+              {first_name}, {company} is the kind of multi-unit company we'd want to back the new operating team at — not the cap-table version of it.
+        ask_variants:
+          - slots: []
+            text: "Worth 20 minutes about us putting capital in?"
+          - slots: []
+            text: "Open to a short call?"
+        fallback:
+          slots: [first_name, company]
+          subject: "{company}"
+          body: |
+            {first_name}, {company} is the kind of regional business we'd want to back the operator at, not replace.
+
+            Worth a call about us putting capital in?
+
+      pe_owned:
+        label: "PE-Owned Portfolio Leadership"
+        subject_variants:
+          - slots: [company]
+            text: "{company} — before the process"
+          - slots: [first_name]
+            text: "{first_name} — investment ask"
+        thesis_variants:
+          - slots: [first_name, company, pe_sponsor]
+            text: |
+              {first_name}, the {pe_sponsor} hold on {company} is probably in its back half, and regional businesses are the only kind we write secondary checks into — we'd rather have the conversation before any bank is involved.
+          - slots: [first_name, company]
+            text: |
+              {first_name}, {company} is the kind of regional business we want to be the next investor in, and those conversations almost always go better before a process is running.
+        ask_variants:
+          - slots: []
+            text: "Open to a quiet 20-minute call?"
+          - slots: []
+            text: "Worth a call ahead of anything formal?"
+        fallback:
+          slots: [first_name, company]
+          subject: "{company}"
+          body: |
+            {first_name}, {company} is on a short list of regional businesses we want to be the next investor in.
+
+            Open to a quiet call before any process kicks off?
+
+      generational_family:
+        label: "Generational / Family Ownership"
+        subject_variants:
+          - slots: [company]
+            text: "{company}"
+          - slots: [first_name]
+            text: "{first_name} — a thought"
+        thesis_variants:
+          - slots: [first_name, company, family_signal]
+            text: |
+              {first_name}, {family_signal} of family ownership at a regional business like {company} isn't something a flip-shop investor knows how to handle — and we'd rather be the patient kind of capital you'd actually let in.
+          - slots: [first_name, company, region]
+            text: |
+              {first_name}, the family business you've run around {region} at {company} is the kind we want to hold for the long run, not strip and resell — and that's why we'd like to put money in.
+          - slots: [first_name, company]
+            text: |
+              {first_name}, family-held regional businesses like {company} are the only kind we hold for the long run, and we'd rather be your investor than someone who'd flip it.
+        ask_variants:
+          - slots: []
+            text: "Open to a quiet call?"
+          - slots: []
+            text: "Worth a call to see if we'd be the right partner?"
+        fallback:
+          slots: [first_name, company]
+          subject: "{company}"
+          body: |
+            {first_name}, family-held regional businesses are the only kind we hold for the long run, and {company} is one we'd want to back.
+
+            Open to a quiet call about us putting capital in?

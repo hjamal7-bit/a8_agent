@@ -55,7 +55,7 @@ async def test_enrollment_generates_drafts(
     assert result["skipped"] == 0
     
     # Verify database was queried
-    conn.fetchrow.assert_called_once()
+    assert conn.fetchrow.call_count == 2
     conn.fetch.assert_called_once()
     
     # Verify drafts were inserted (3 per touch: check existing + insert)

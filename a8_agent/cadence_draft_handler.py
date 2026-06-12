@@ -22,6 +22,12 @@ from fastapi import APIRouter, HTTPException
 
 from a8_agent.metrics import metrics_collector
 
+# NEW (2026-05-20): cold-outreach engine. Used for sequence_number == 1 only;
+# follow-up touches (seq >= 2) keep the legacy template-copy path until a
+# follow-up engine ships.
+from a8_agent.outreach.engine import generate_draft as _outreach_generate_draft
+from a8_agent.outreach.ingest import load_profile as _outreach_load_profile
+
 router = APIRouter(tags=["cadence"])
 
 
@@ -147,7 +153,22 @@ class CadenceDraftGenerator:
                     if existing > 0:
                         continue  # Skip, already drafted
 
-                    # Create draft from touch template
+                    # Compute subject/body. New cold-outreach engine for the
+                    # first touch; legacy template-copy for follow-ups.
+                    if touch_seq == 1:
+                        profile = await _outreach_load_profile(conn, contact_id)
+                        new_draft = _outreach_generate_draft(profile)
+                        subject_to_insert = new_draft.subject
+                        body_to_insert = new_draft.body
+                        # LEGACY (kept commented for one-cycle rollback):
+                        # subject_to_insert = touch["hook"]
+                        # body_to_insert = touch["guidance"] or ""
+                    else:
+                        # Follow-up touches: unchanged behavior.
+                        subject_to_insert = touch["hook"]
+                        body_to_insert = touch["guidance"] or ""
+
+                    # Create draft
                     draft_id = await conn.fetchval(
                         """
                         INSERT INTO drafts (
@@ -163,9 +184,9 @@ class CadenceDraftGenerator:
                         touch["id"],
                         contact_id,
                         touch["channel"],
-                        touch["hook"],  # Use hook as subject for now
-                        touch["guidance"] or "",  # Use guidance as body
-                        touch["hook"],
+                        subject_to_insert,
+                        body_to_insert,
+                        touch["hook"],  # drafts.hook keeps template lineage for analytics
                         touch["expected_outcome"],
                         touch_seq,
                     )
