@@ -1,0 +1,908 @@
+================================================================================
+ A8 AGENT — CRM CODEBASE EXPORT
+ Cadence draft generation & CRM integration
+ Version 0.1.0
+================================================================================
+
+This file contains every line of source code for the a8_agent CRM integration,
+concatenated with file-path headers. Project layout:
+
+  a8_agent/
+    __init__.py
+    cadence_draft_handler.py
+    cli.py
+    metrics.py
+    web/
+      __init__.py
+      app.py
+  setup.py
+  requirements.txt
+
+
+================================================================================
+FILE: a8_agent/__init__.py
+================================================================================
+
+"""A8 Agent — Cadence draft generation consolidation."""
+__version__ = "0.1.0"
+
+
+================================================================================
+FILE: a8_agent/cadence_draft_handler.py
+================================================================================
+
+"""
+Cadence Draft Generation Handler
+
+Generates drafts automatically when a contact enrolls in a cadence.
+Uses Postgres LISTEN/NOTIFY for event-driven generation.
+
+INTEGRATION:
+1. FastAPI lifespan initializes the handler and starts listener
+2. Database trigger sends notification on cadence_instances INSERT
+3. Handler auto-generates drafts for the enrolled contact
+4. Manual endpoints also available for regeneration
+"""
+
+import asyncio
+import time
+from datetime import datetime
+from typing import Optional
+from contextlib import asynccontextmanager
+
+import asyncpg
+from fastapi import APIRouter, HTTPException
+
+from a8_agent.metrics import metrics_collector
+
+router = APIRouter(tags=["cadence"])
+
+
+class CadenceDraftGenerator:
+    """Handles cadence draft generation on-demand and on enrollment via LISTEN/NOTIFY."""
+
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self.pool: Optional[asyncpg.pool.Pool] = None
+        self.listener_task: Optional[asyncio.Task] = None
+        self.listener_conn: Optional[asyncpg.Connection] = None
+
+    async def initialize(self):
+        """Create connection pool and start listener."""
+        self.pool = await asyncpg.create_pool(self.db_url, min_size=2, max_size=10)
+        # Start listener in background
+        self.listener_task = asyncio.create_task(self._start_listener())
+
+    async def close(self):
+        """Close connection pool and listener."""
+        if self.listener_task:
+            self.listener_task.cancel()
+            try:
+                await self.listener_task
+            except asyncio.CancelledError:
+                pass
+        if self.listener_conn:
+            await self.listener_conn.close()
+        if self.pool:
+            await self.pool.close()
+
+    async def _start_listener(self):
+        """Listen for cadence enrollments and auto-generate drafts."""
+        try:
+            self.listener_conn = await asyncpg.connect(self.db_url)
+            await self.listener_conn.add_listener('cadence_enroll', self._on_cadence_enroll)
+            print("✓ Cadence enrollment listener started")
+            # Keep listening
+            while True:
+                await asyncio.sleep(3600)  # Just keep the task alive
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"✗ Listener error: {e}")
+
+    def _on_cadence_enroll(self, connection, pid, channel, payload):
+        """Callback when cadence enrollment notification is received."""
+        # Schedule the generation in the event loop
+        asyncio.create_task(self.generate_for_enrollment(payload))
+        print(f"Auto-generating drafts for cadence instance {payload}")
+
+    async def generate_for_enrollment(self, cadence_instance_id: str) -> dict:
+        """
+        Generate drafts when a contact is enrolled in a cadence.
+        Called via:
+          1. Database trigger (automatic on INSERT)
+          2. POST /cadence/{cadence_instance_id}/generate-on-enroll (manual)
+
+        For each touch in the cadence template, create one draft.
+
+        Args:
+            cadence_instance_id: UUID of newly created cadence_instance
+
+        Returns:
+            {
+                "generated": [draft_ids],
+                "skipped": int,
+                "error": null or error message
+            }
+        """
+        if not self.pool:
+            raise RuntimeError("CadenceDraftGenerator not initialized")
+
+        start_time = time.time()
+        async with self.pool.acquire() as conn:
+            try:
+                # Get cadence instance and template
+                instance = await conn.fetchrow(
+                    """
+                    SELECT ci.id, ci.cadence_template_id, ci.contact_id,
+                           ct.name
+                    FROM cadence_instances ci
+                    JOIN cadence_templates ct ON ci.cadence_template_id = ct.id
+                    WHERE ci.id = $1
+                    """,
+                    cadence_instance_id,
+                )
+
+                if not instance:
+                    return {"error": f"Cadence instance {cadence_instance_id} not found"}
+
+                template_name = instance["name"]
+                template_id = instance["cadence_template_id"]
+                contact_id = instance["contact_id"]
+
+                # Get all touches for this template, ordered by sequence
+                touches = await conn.fetch(
+                    """
+                    SELECT id, sequence_number, channel, hook, expected_outcome,
+                           guidance, cta, tone_guidance, suggested_length_words
+                    FROM cadence_touches
+                    WHERE cadence_template_id = $1
+                    ORDER BY sequence_number ASC
+                    """,
+                    template_id,
+                )
+
+                # Generate one draft per touch
+                drafted_ids = []
+                for touch in touches:
+                    touch_seq = touch["sequence_number"]
+
+                    # Check if draft already exists for this touch
+                    existing = await conn.fetchval(
+                        """
+                        SELECT COUNT(*) FROM drafts
+                        WHERE cadence_instance_id = $1 AND cadence_touch_id = $2
+                        """,
+                        cadence_instance_id,
+                        touch["id"],
+                    )
+
+                    if existing > 0:
+                        continue  # Skip, already drafted
+
+                    # Create draft from touch template
+                    draft_id = await conn.fetchval(
+                        """
+                        INSERT INTO drafts (
+                            cadence_instance_id, cadence_touch_id, contact_id,
+                            channel, subject, body, hook, expected_outcome,
+                            sequence_number, is_cadence_draft, status,
+                            created_from, created_at
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, 'pending_approval', 'cadence', NOW())
+                        RETURNING id
+                        """,
+                        cadence_instance_id,
+                        touch["id"],
+                        contact_id,
+                        touch["channel"],
+                        touch["hook"],  # Use hook as subject for now
+                        touch["guidance"] or "",  # Use guidance as body
+                        touch["hook"],
+                        touch["expected_outcome"],
+                        touch_seq,
+                    )
+
+                    drafted_ids.append(draft_id)
+                    metrics_collector.record_draft_generated()
+
+                metrics_collector.record_cadence_enrollment()
+                latency_ms = (time.time() - start_time) * 1000
+                return {
+                    "generated": drafted_ids,
+                    "skipped": len(touches) - len(drafted_ids),
+                    "error": None,
+                    "latency_ms": latency_ms,
+                }
+
+            except Exception as e:
+                metrics_collector.record_error("generate_for_enrollment")
+                return {"error": str(e), "generated": [], "skipped": 0}
+
+    async def regenerate_for_template(self, template_id: str, force: bool = False) -> dict:
+        """
+        Manually regenerate drafts for all active instances of a cadence template.
+
+        Args:
+            template_id: UUID of cadence_template
+            force: If True, regenerate even if drafts exist
+
+        Returns:
+            {"total_instances": N, "generated": {instance_id: count}, "errors": []}
+        """
+        if not self.pool:
+            raise RuntimeError("CadenceDraftGenerator not initialized")
+
+        async with self.pool.acquire() as conn:
+            # Get all active instances of this template
+            instances = await conn.fetch(
+                """
+                SELECT id FROM cadence_instances
+                WHERE cadence_template_id = $1 AND status = 'active'
+                """,
+                template_id,
+            )
+
+            results = {}
+            errors = []
+
+            for instance_row in instances:
+                instance_id = instance_row["id"]
+                try:
+                    if force:
+                        # Delete existing drafts for this instance
+                        await conn.execute(
+                            "DELETE FROM drafts WHERE cadence_instance_id = $1 AND is_cadence_draft = true",
+                            instance_id,
+                        )
+
+                    # Generate new drafts
+                    result = await self.generate_for_enrollment(instance_id)
+                    results[instance_id] = len(result.get("generated", []))
+
+                except Exception as e:
+                    errors.append({"instance_id": instance_id, "error": str(e)})
+
+            return {
+                "total_instances": len(instances),
+                "generated": results,
+                "errors": errors,
+            }
+
+
+# Module-level instance (initialized in FastAPI lifespan)
+_cadence_generator: Optional[CadenceDraftGenerator] = None
+
+
+@asynccontextmanager
+async def cadence_lifespan(app):
+    """FastAPI lifespan context: initialize cadence handler on startup."""
+    global _cadence_generator
+
+    db_url = app.state.database_url
+    _cadence_generator = CadenceDraftGenerator(db_url)
+    await _cadence_generator.initialize()
+
+    yield
+
+    # Cleanup
+    await _cadence_generator.close()
+
+
+@router.post("/{cadence_instance_id}/generate-on-enroll")
+async def enroll_generate(cadence_instance_id: str):
+    """
+    Generate all drafts for an enrolled contact immediately.
+
+    Usage: POST /cadence/{uuid}/generate-on-enroll
+    """
+    if not _cadence_generator:
+        raise HTTPException(500, "Cadence handler not initialized")
+
+    result = await _cadence_generator.generate_for_enrollment(cadence_instance_id)
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@router.post("/template/{template_id}/regenerate")
+async def regenerate_template(template_id: str, force: bool = False):
+    """
+    Manual endpoint: regenerate drafts for all active instances of a template.
+
+    Usage: POST /cadence/template/{uuid}/regenerate?force=true
+    """
+    if not _cadence_generator:
+        raise HTTPException(500, "Cadence handler not initialized")
+
+    result = await _cadence_generator.regenerate_for_template(template_id, force)
+    return result
+
+
+================================================================================
+FILE: a8_agent/cli.py
+================================================================================
+
+"""
+CLI for a8_agent cadence operations.
+
+Usage:
+  a8_cadence regenerate <template_id>  - Regenerate drafts for all active instances of a template
+  a8_cadence regenerate <instance_id> --instance  - Regenerate drafts for a single instance
+  a8_cadence status  - Check health of a8_agent service
+"""
+
+import asyncio
+import sys
+import os
+from typing import Optional
+
+import click
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+A8_AGENT_URL = os.getenv("A8_AGENT_URL", "http://127.0.0.1:8788")
+DATABASE_URL = os.getenv("A8_DATABASE_URL", "postgresql://localhost/a8")
+
+
+@click.group()
+def cli():
+    """a8_agent CLI - Cadence draft operations."""
+    pass
+
+
+@cli.command()
+@click.argument("template_id")
+@click.option("--instance", is_flag=True, help="Treat ID as cadence_instance_id instead of template_id")
+@click.option("--force", is_flag=True, help="Force regeneration even if drafts exist")
+def regenerate(template_id: str, instance: bool, force: bool):
+    """
+    Regenerate cadence drafts.
+
+    By default, regenerates all active instances for a template.
+    Use --instance to regenerate a single cadence instance.
+    Use --force to skip draft existence checks.
+    """
+    try:
+        if instance:
+            endpoint = f"{A8_AGENT_URL}/cadence/{template_id}/generate-on-enroll"
+            params = {"force": force}
+        else:
+            endpoint = f"{A8_AGENT_URL}/cadence/template/{template_id}/regenerate"
+            params = {"force": force}
+
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(endpoint, params=params)
+            response.raise_for_status()
+
+        result = response.json()
+
+        if "generated_count" in result:
+            click.secho(
+                f"✓ Generated {result['generated_count']} drafts",
+                fg="green"
+            )
+
+        if "instances_processed" in result:
+            click.secho(
+                f"✓ Processed {result['instances_processed']} instances",
+                fg="green"
+            )
+
+        if "message" in result:
+            click.echo(f"  {result['message']}")
+
+        # Show details if available
+        if "details" in result:
+            for detail in result["details"]:
+                click.echo(f"  - {detail}")
+
+        sys.exit(0)
+
+    except httpx.HTTPError as e:
+        click.secho(f"✗ API error: {e}", fg="red")
+        sys.exit(1)
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red")
+        sys.exit(1)
+
+
+@cli.command()
+def status():
+    """Check health and status of a8_agent service."""
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get(f"{A8_AGENT_URL}/health")
+            response.raise_for_status()
+
+        health = response.json()
+
+        click.secho("✓ a8_agent is running", fg="green")
+        click.echo(f"  Service: {health.get('service', 'unknown')}")
+        click.echo(f"  Status: {health.get('status', 'unknown')}")
+
+        if "version" in health:
+            click.echo(f"  Version: {health['version']}")
+
+        sys.exit(0)
+
+    except httpx.ConnectError:
+        click.secho(f"✗ Cannot connect to a8_agent at {A8_AGENT_URL}", fg="red")
+        click.echo("  Is the service running? Check: launchctl list | grep cadence-agent")
+        sys.exit(1)
+    except httpx.HTTPError as e:
+        click.secho(f"✗ Service error: {e}", fg="red")
+        sys.exit(1)
+
+
+@cli.command()
+def logs():
+    """Tail a8_agent service logs."""
+    log_path = os.path.expanduser("~/.a8/logs/cadence-agent.log")
+
+    if not os.path.exists(log_path):
+        click.secho(f"✗ Log file not found: {log_path}", fg="red")
+        sys.exit(1)
+
+    try:
+        os.execvp("tail", ["tail", "-f", log_path])
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()
+
+
+================================================================================
+FILE: a8_agent/metrics.py
+================================================================================
+
+"""
+Prometheus-style metrics for a8_agent
+
+Tracks:
+- Draft generation count and latency
+- Error rates and failure modes
+- CRM API call counts and latency
+- Cadence trigger success rate
+- HTTP endpoint metrics
+
+Metrics are collected in-memory and exposed via HTTP endpoint for scraping.
+
+Usage:
+  from a8_agent.metrics import metrics_collector, setup_metrics_routes
+
+  # In FastAPI app:
+  setup_metrics_routes(app)
+
+  # Record metrics:
+  metrics_collector.record_draft_generated()
+  metrics_collector.record_crm_call(duration_ms=42, success=True)
+"""
+
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class MetricType(Enum):
+    """Types of metrics."""
+    COUNTER = "counter"
+    GAUGE = "gauge"
+    HISTOGRAM = "histogram"
+
+
+@dataclass
+class MetricSnapshot:
+    """Snapshot of a single metric value."""
+    name: str
+    type: MetricType
+    value: float
+    timestamp: str
+    labels: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class HistogramBucket:
+    """Histogram bucket for latency tracking."""
+    le: float  # less than or equal
+    count: int
+
+
+class MetricsCollector:
+    """In-memory metrics collector for a8_agent."""
+
+    def __init__(self, retention_seconds: int = 3600):
+        self.retention_seconds = retention_seconds
+
+        # Counters
+        self.drafts_generated_total = 0
+        self.drafts_failed_total = 0
+        self.cadence_enrollments_total = 0
+        self.crm_api_calls_total = 0
+        self.crm_api_errors_total = 0
+
+        # Gauges
+        self.active_draft_generation_jobs = 0
+        self.current_error_rate = 0.0
+
+        # Histograms (latencies in milliseconds)
+        self.draft_generation_latencies: List[float] = []
+        self.crm_api_latencies: List[float] = []
+
+        # Error tracking
+        self.error_counts: Dict[str, int] = {}
+
+        # Timestamps
+        self._start_time = time.time()
+        self._last_reset = time.time()
+
+    def record_draft_generated(self, latency_ms: Optional[float] = None, error: bool = False):
+        """
+        Record a draft generation event.
+
+        Args:
+            latency_ms: Time taken to generate draft
+            error: Whether generation failed
+        """
+        if error:
+            self.drafts_failed_total += 1
+        else:
+            self.drafts_generated_total += 1
+            if latency_ms is not None:
+                self.draft_generation_latencies.append(latency_ms)
+                self._trim_histograms()
+
+    def record_cadence_enrollment(self):
+        """Record a cadence enrollment."""
+        self.cadence_enrollments_total += 1
+
+    def record_crm_call(self, latency_ms: float, success: bool = True, operation: str = "unknown"):
+        """
+        Record a CRM API call.
+
+        Args:
+            latency_ms: Call duration in milliseconds
+            success: Whether call succeeded
+            operation: Type of operation (read, write, update, delete)
+        """
+        self.crm_api_calls_total += 1
+
+        if success:
+            self.crm_api_latencies.append(latency_ms)
+            self._trim_histograms()
+        else:
+            self.crm_api_errors_total += 1
+            self.error_counts[operation] = self.error_counts.get(operation, 0) + 1
+
+    def record_error(self, error_type: str):
+        """Record an error."""
+        self.error_counts[error_type] = self.error_counts.get(error_type, 0) + 1
+        self.drafts_failed_total += 1
+
+    def set_active_jobs(self, count: int):
+        """Set the current number of active draft generation jobs."""
+        self.active_draft_generation_jobs = count
+
+    def _trim_histograms(self):
+        """Remove old entries from histograms to respect retention."""
+        max_size = 10000
+
+        if len(self.draft_generation_latencies) > max_size:
+            self.draft_generation_latencies = self.draft_generation_latencies[-max_size:]
+
+        if len(self.crm_api_latencies) > max_size:
+            self.crm_api_latencies = self.crm_api_latencies[-max_size:]
+
+    def update_error_rate(self):
+        """Update current error rate based on recent failures."""
+        total = self.drafts_generated_total + self.drafts_failed_total
+        if total > 0:
+            self.current_error_rate = self.drafts_failed_total / total
+        else:
+            self.current_error_rate = 0.0
+
+    def get_uptime_seconds(self) -> int:
+        """Get service uptime in seconds."""
+        return int(time.time() - self._start_time)
+
+    def get_percentile(self, data: List[float], percentile: float) -> Optional[float]:
+        """Calculate percentile from list of values."""
+        if not data:
+            return None
+
+        sorted_data = sorted(data)
+        index = int(len(sorted_data) * percentile / 100)
+        return sorted_data[min(index, len(sorted_data) - 1)]
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """Get current metrics snapshot for export."""
+        self.update_error_rate()
+
+        draft_latencies = self.draft_generation_latencies
+        crm_latencies = self.crm_api_latencies
+
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "uptime_seconds": self.get_uptime_seconds(),
+            "drafts": {
+                "generated_total": self.drafts_generated_total,
+                "failed_total": self.drafts_failed_total,
+                "success_rate": (
+                    self.drafts_generated_total / (self.drafts_generated_total + self.drafts_failed_total)
+                    if (self.drafts_generated_total + self.drafts_failed_total) > 0
+                    else 0.0
+                ),
+                "latency": {
+                    "count": len(draft_latencies),
+                    "mean_ms": sum(draft_latencies) / len(draft_latencies) if draft_latencies else 0.0,
+                    "median_ms": self.get_percentile(draft_latencies, 50),
+                    "p95_ms": self.get_percentile(draft_latencies, 95),
+                    "p99_ms": self.get_percentile(draft_latencies, 99),
+                    "min_ms": min(draft_latencies) if draft_latencies else 0.0,
+                    "max_ms": max(draft_latencies) if draft_latencies else 0.0,
+                },
+            },
+            "cadence": {
+                "enrollments_total": self.cadence_enrollments_total,
+            },
+            "crm_api": {
+                "calls_total": self.crm_api_calls_total,
+                "errors_total": self.crm_api_errors_total,
+                "error_rate": (
+                    self.crm_api_errors_total / self.crm_api_calls_total
+                    if self.crm_api_calls_total > 0
+                    else 0.0
+                ),
+                "latency": {
+                    "count": len(crm_latencies),
+                    "mean_ms": sum(crm_latencies) / len(crm_latencies) if crm_latencies else 0.0,
+                    "median_ms": self.get_percentile(crm_latencies, 50),
+                    "p95_ms": self.get_percentile(crm_latencies, 95),
+                    "p99_ms": self.get_percentile(crm_latencies, 99),
+                    "min_ms": min(crm_latencies) if crm_latencies else 0.0,
+                    "max_ms": max(crm_latencies) if crm_latencies else 0.0,
+                },
+            },
+            "errors": {
+                "by_type": self.error_counts,
+                "error_rate": self.current_error_rate,
+            },
+            "jobs": {
+                "active": self.active_draft_generation_jobs,
+            },
+        }
+
+    def get_prometheus_text(self) -> str:
+        """Export metrics in Prometheus text format."""
+        snapshot = self.get_snapshot()
+
+        lines = [
+            "# HELP a8_drafts_generated_total Total number of drafts generated",
+            "# TYPE a8_drafts_generated_total counter",
+            f"a8_drafts_generated_total {self.drafts_generated_total}",
+            "",
+            "# HELP a8_drafts_failed_total Total number of failed draft generations",
+            "# TYPE a8_drafts_failed_total counter",
+            f"a8_drafts_failed_total {self.drafts_failed_total}",
+            "",
+            "# HELP a8_cadence_enrollments_total Total number of cadence enrollments",
+            "# TYPE a8_cadence_enrollments_total counter",
+            f"a8_cadence_enrollments_total {self.cadence_enrollments_total}",
+            "",
+            "# HELP a8_crm_api_calls_total Total number of CRM API calls",
+            "# TYPE a8_crm_api_calls_total counter",
+            f"a8_crm_api_calls_total {self.crm_api_calls_total}",
+            "",
+            "# HELP a8_crm_api_errors_total Total number of CRM API errors",
+            "# TYPE a8_crm_api_errors_total counter",
+            f"a8_crm_api_errors_total {self.crm_api_errors_total}",
+            "",
+            "# HELP a8_draft_generation_latency_ms Draft generation latency in milliseconds",
+            "# TYPE a8_draft_generation_latency_ms summary",
+            f"a8_draft_generation_latency_ms_sum {sum(self.draft_generation_latencies):.2f}",
+            f"a8_draft_generation_latency_ms_count {len(self.draft_generation_latencies)}",
+            "",
+            "# HELP a8_crm_api_latency_ms CRM API call latency in milliseconds",
+            "# TYPE a8_crm_api_latency_ms summary",
+            f"a8_crm_api_latency_ms_sum {sum(self.crm_api_latencies):.2f}",
+            f"a8_crm_api_latency_ms_count {len(self.crm_api_latencies)}",
+            "",
+            "# HELP a8_active_jobs Number of active draft generation jobs",
+            "# TYPE a8_active_jobs gauge",
+            f"a8_active_jobs {self.active_draft_generation_jobs}",
+            "",
+            "# HELP a8_error_rate Current error rate (0-1)",
+            "# TYPE a8_error_rate gauge",
+            f"a8_error_rate {self.current_error_rate:.4f}",
+            "",
+        ]
+
+        return "\n".join(lines)
+
+    def reset(self):
+        """Reset all metrics."""
+        self.drafts_generated_total = 0
+        self.drafts_failed_total = 0
+        self.cadence_enrollments_total = 0
+        self.crm_api_calls_total = 0
+        self.crm_api_errors_total = 0
+        self.active_draft_generation_jobs = 0
+        self.current_error_rate = 0.0
+        self.draft_generation_latencies.clear()
+        self.crm_api_latencies.clear()
+        self.error_counts.clear()
+        self._last_reset = time.time()
+
+
+# Global collector instance
+metrics_collector = MetricsCollector()
+
+
+def setup_metrics_routes(app):
+    """
+    Setup metrics endpoints on a FastAPI app.
+
+    Adds:
+    - GET /metrics/json - JSON metrics snapshot
+    - GET /metrics/prometheus - Prometheus text format
+    """
+
+    @app.get("/metrics/json")
+    async def metrics_json():
+        """Return metrics as JSON."""
+        return metrics_collector.get_snapshot()
+
+    @app.get("/metrics/prometheus")
+    async def metrics_prometheus():
+        """Return metrics in Prometheus text format."""
+        return metrics_collector.get_prometheus_text()
+
+    @app.get("/metrics/health")
+    async def metrics_health():
+        """Quick health summary from metrics."""
+        snapshot = metrics_collector.get_snapshot()
+
+        return {
+            "healthy": snapshot["drafts"]["success_rate"] > 0.95,
+            "success_rate": snapshot["drafts"]["success_rate"],
+            "error_rate": snapshot["errors"]["error_rate"],
+            "uptime_seconds": snapshot["uptime_seconds"],
+            "active_jobs": snapshot["jobs"]["active"],
+        }
+
+
+================================================================================
+FILE: a8_agent/web/__init__.py
+================================================================================
+
+# FastAPI web module
+
+
+================================================================================
+FILE: a8_agent/web/app.py
+================================================================================
+
+"""A8 Agent FastAPI app — consolidates cadence draft generation."""
+
+from contextlib import asynccontextmanager
+import os
+from fastapi import FastAPI
+from a8_agent.cadence_draft_handler import cadence_lifespan, router as cadence_router
+from a8_agent.metrics import setup_metrics_routes
+
+
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    """App lifespan: initialize cadence handler."""
+    async with cadence_lifespan(app) as _:
+        yield
+
+
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI app."""
+
+    # Get database URL from environment
+    db_url = os.getenv(
+        "A8_DATABASE_URL",
+        "postgresql://localhost/a8_crm"
+    )
+
+    app = FastAPI(
+        title="A8 Agent",
+        description="Cadence draft generation and orchestration",
+        version="0.1.0",
+        lifespan=app_lifespan
+    )
+
+    # Store config in app state
+    app.state.database_url = db_url
+
+    # Include cadence router
+    app.include_router(cadence_router, prefix="/cadence")
+
+    # Setup metrics endpoints
+    setup_metrics_routes(app)
+
+    # Health check
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "service": "a8_agent"}
+
+    return app
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8788,
+        log_level="info"
+    )
+
+
+================================================================================
+FILE: setup.py
+================================================================================
+
+from setuptools import setup, find_packages
+
+setup(
+    name="a8_agent",
+    version="0.1.0",
+    description="A8 cadence draft generation and orchestration",
+    author="Jamal",
+    packages=find_packages(),
+    python_requires=">=3.11",
+    install_requires=[
+        "fastapi>=0.104",
+        "uvicorn[standard]>=0.24",
+        "asyncpg>=0.29",
+        "sqlalchemy>=2.0",
+        "psycopg2-binary>=2.9",
+        "pydantic>=2.5",
+        "python-dotenv>=1.0",
+        "click>=8.0",
+        "httpx>=0.25",
+    ],
+    extras_require={
+        "dev": [
+            "pytest>=7.0",
+            "pytest-asyncio>=0.23",
+            "pytest-cov>=4.1",
+        ],
+    },
+    entry_points={
+        "console_scripts": [
+            "a8_cadence=a8_agent.cli:cli",
+        ],
+    },
+)
+
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+asyncpg==0.29.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+pydantic==2.5.0
+python-dotenv==1.0.0
+click==8.1.7
+httpx==0.25.2
+
+================================================================================
+END OF EXPORT
+================================================================================
