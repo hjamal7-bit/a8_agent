@@ -35,18 +35,20 @@ class HealthStatus:
     service_running: bool
     http_endpoint_ok: bool
     database_connected: bool
+    listener_connected: bool
     process_uptime_seconds: Optional[int]
     process_memory_mb: Optional[float]
     error_rate: float
     last_error: Optional[str]
     checks_passed: int
     checks_total: int
-    
+
     def is_healthy(self) -> bool:
         """Returns True if all critical checks pass."""
         return (
             self.service_running and
             self.http_endpoint_ok and
+            self.listener_connected and  # a dead listener means no drafts generated
             self.checks_passed >= self.checks_total - 1  # Allow 1 non-critical failure
         )
 
@@ -104,24 +106,38 @@ class A8HealthChecker:
             return False, str(e)
     
     async def check_http_endpoint(self) -> tuple[bool, Optional[str]]:
-        """Check if HTTP health endpoint responds."""
+        """Check if HTTP health endpoint responds, capturing listener status."""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(f"{self.http_url}/health")
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     status = data.get("status", "unknown")
+                    # Cache the listener block so check_listener can read it
+                    # without a second HTTP round-trip.
+                    self.check_history["listener"] = data.get("listener")
                     return True, f"HTTP 200 (status: {status})"
                 else:
                     return False, f"HTTP {response.status_code}"
-        
+
         except httpx.ConnectError:
             return False, "Connection refused"
         except httpx.TimeoutException:
             return False, "Timeout"
         except Exception as e:
             return False, str(e)
+
+    def check_listener(self) -> tuple[bool, Optional[str]]:
+        """Check the enrollment LISTEN/NOTIFY connection reported by /health."""
+        listener = self.check_history.get("listener")
+        if listener is None:
+            # Older agent without listener reporting, or /health unreachable.
+            return False, "Listener status unavailable"
+        if listener.get("connected"):
+            reconnects = listener.get("reconnects", 0)
+            return True, f"Connected (reconnects: {reconnects})"
+        return False, f"Listener DOWN: {listener.get('last_error') or 'not connected'}"
     
     def check_database_connectivity(self) -> tuple[bool, Optional[str]]:
         """Check if database is reachable (parse connection string only; don't actually connect)."""
@@ -243,50 +259,65 @@ class A8HealthChecker:
     async def run_all_checks(self) -> HealthStatus:
         """Run all health checks and return combined status."""
         checks_passed = 0
-        checks_total = 5
-        
+        checks_total = 6
+
         # Check 1: launchd status
         launchd_ok, launchd_msg = self.check_launchd_status()
         if launchd_ok:
             checks_passed += 1
-        
-        # Check 2: HTTP endpoint
+
+        # Check 2: HTTP endpoint (also caches listener status)
         http_ok, http_msg = await self.check_http_endpoint()
         if http_ok:
             checks_passed += 1
         else:
             self.error_count += 1
-        
-        # Check 3: Database connectivity
+
+        # Check 3: Enrollment listener (LISTEN/NOTIFY) liveness
+        listener_ok, listener_msg = self.check_listener()
+        if listener_ok:
+            checks_passed += 1
+        else:
+            self.error_count += 1
+
+        # Check 4: Database connectivity
         db_ok, db_msg = self.check_database_connectivity()
         if db_ok:
             checks_passed += 1
-        
-        # Check 4: Process uptime
+
+        # Check 5: Process uptime
         uptime_sec, uptime_err = self.check_process_uptime()
         if uptime_sec is not None:
             checks_passed += 1
-        
-        # Check 5: Process memory
+
+        # Check 6: Process memory
         memory_mb, mem_err = self.check_process_memory()
         if memory_mb is not None:
             checks_passed += 1
-        
+
         # Error rate from logs
         error_rate = self.check_error_rate()
-        
-        # Determine last error
+
+        # Determine last error (prefer the listener failure — it's the silent one)
         last_error = None
-        for msg in [launchd_msg, http_msg, db_msg, uptime_err, mem_err]:
-            if msg:
+        for ok, msg in [
+            (launchd_ok, launchd_msg),
+            (http_ok, http_msg),
+            (listener_ok, listener_msg),
+            (db_ok, db_msg),
+            (uptime_sec is not None, uptime_err),
+            (memory_mb is not None, mem_err),
+        ]:
+            if not ok and msg:
                 last_error = msg
                 break
-        
+
         return HealthStatus(
             timestamp=datetime.utcnow().isoformat(),
             service_running=launchd_ok,
             http_endpoint_ok=http_ok,
             database_connected=db_ok,
+            listener_connected=listener_ok,
             process_uptime_seconds=uptime_sec,
             process_memory_mb=memory_mb,
             error_rate=error_rate,
@@ -349,6 +380,7 @@ def print_status(status: HealthStatus):
     print(f"\nDetails:")
     print(f"  Service Running:    {status.service_running}")
     print(f"  HTTP Endpoint:      {status.http_endpoint_ok}")
+    print(f"  Enroll Listener:    {status.listener_connected}")
     print(f"  Database:           {status.database_connected}")
     print(f"  Process Uptime:     {format_seconds(status.process_uptime_seconds)}")
     print(f"  Process Memory:     {status.process_memory_mb:.1f} MB" if status.process_memory_mb else "  Process Memory:     Unknown")

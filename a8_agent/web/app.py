@@ -3,7 +3,11 @@
 from contextlib import asynccontextmanager
 import os
 from fastapi import FastAPI
-from a8_agent.cadence_draft_handler import cadence_lifespan, router as cadence_router
+from a8_agent.cadence_draft_handler import (
+    cadence_lifespan,
+    router as cadence_router,
+    listener_health,
+)
 from a8_agent.metrics import setup_metrics_routes
 
 
@@ -39,10 +43,14 @@ def create_app() -> FastAPI:
     # Setup metrics endpoints
     setup_metrics_routes(app)
     
-    # Health check
+    # Health check. Reports "degraded" when the enrollment listener is down so
+    # a silently-dead listener can't pass as healthy (enrollments would produce
+    # no drafts while the web server still answers 200).
     @app.get("/health")
     async def health():
-        return {"status": "ok", "service": "a8_agent"}
+        listener = listener_health()
+        status = "ok" if listener.get("connected") else "degraded"
+        return {"status": status, "service": "a8_agent", "listener": listener}
     
     return app
 
