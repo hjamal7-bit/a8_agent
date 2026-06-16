@@ -28,11 +28,26 @@ router = APIRouter(tags=["cadence"])
 class CadenceDraftGenerator:
     """Handles cadence draft generation on-demand and on enrollment via LISTEN/NOTIFY."""
 
+    # Reconnect/backoff tuning for the LISTEN connection.
+    _RECONNECT_BASE_DELAY = 1.0   # seconds
+    _RECONNECT_MAX_DELAY = 60.0   # seconds
+    _HEARTBEAT_INTERVAL = 30.0    # seconds between liveness probes
+
     def __init__(self, db_url: str):
         self.db_url = db_url
         self.pool: Optional[asyncpg.pool.Pool] = None
         self.listener_task: Optional[asyncio.Task] = None
         self.listener_conn: Optional[asyncpg.Connection] = None
+
+        # Listener liveness state (surfaced via /health and the health checker).
+        self.listener_connected = False
+        self.listener_last_connected_at: Optional[float] = None
+        self.listener_last_error: Optional[str] = None
+        self.listener_reconnects = 0
+
+        # Hold strong references to in-flight enrollment tasks so the event loop
+        # doesn't garbage-collect them mid-run (asyncio only keeps weak refs).
+        self._pending_tasks: set = set()
 
     async def initialize(self):
         """Create connection pool and start listener."""
@@ -48,30 +63,96 @@ class CadenceDraftGenerator:
                 await self.listener_task
             except asyncio.CancelledError:
                 pass
-        if self.listener_conn:
-            await self.listener_conn.close()
+        # Cancel any in-flight enrollment generations.
+        for task in list(self._pending_tasks):
+            task.cancel()
+        await self._close_listener_conn()
         if self.pool:
             await self.pool.close()
 
+    async def _close_listener_conn(self):
+        """Close the LISTEN connection if open, swallowing teardown errors."""
+        if self.listener_conn is not None:
+            try:
+                await self.listener_conn.close()
+            except Exception:
+                pass
+            self.listener_conn = None
+        self.listener_connected = False
+
     async def _start_listener(self):
-        """Listen for cadence enrollments and auto-generate drafts."""
-        try:
-            self.listener_conn = await asyncpg.connect(self.db_url)
-            await self.listener_conn.add_listener('cadence_enroll', self._on_cadence_enroll)
-            print("✓ Cadence enrollment listener started")
-            # Keep listening
-            while True:
-                await asyncio.sleep(3600)  # Just keep the task alive
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"✗ Listener error: {e}")
+        """
+        Maintain a live LISTEN connection, reconnecting with exponential backoff.
+
+        The previous implementation opened a single connection and exited the
+        task on the first error. A dropped connection (Postgres restart, idle
+        timeout, network blip, or the host sleeping overnight) therefore left
+        the listener permanently dead while the web server kept reporting
+        healthy — enrollments fired NOTIFY into a void and no drafts were
+        generated. This loop re-establishes the LISTEN and uses a heartbeat to
+        detect silent disconnects.
+        """
+        delay = self._RECONNECT_BASE_DELAY
+        while True:
+            try:
+                self.listener_conn = await asyncpg.connect(self.db_url)
+                await self.listener_conn.add_listener(
+                    'cadence_enroll', self._on_cadence_enroll
+                )
+                self.listener_connected = True
+                self.listener_last_connected_at = time.time()
+                self.listener_last_error = None
+                delay = self._RECONNECT_BASE_DELAY  # reset backoff after a clean connect
+                print("✓ Cadence enrollment listener started")
+
+                # Heartbeat loop: detect dropped connections and reconnect
+                # instead of dying silently. Notifications are still delivered
+                # by asyncpg's protocol while we await here.
+                while True:
+                    await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+                    if self.listener_conn.is_closed():
+                        raise ConnectionError("listener connection closed")
+                    await self.listener_conn.execute("SELECT 1")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.listener_connected = False
+                self.listener_last_error = str(e)
+                self.listener_reconnects += 1
+                metrics_collector.record_error("listener_reconnect")
+                print(f"✗ Listener connection lost ({e}); reconnecting in {delay:.0f}s")
+                await self._close_listener_conn()
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    break
+                delay = min(delay * 2, self._RECONNECT_MAX_DELAY)
+
+        await self._close_listener_conn()
 
     def _on_cadence_enroll(self, connection, pid, channel, payload):
         """Callback when cadence enrollment notification is received."""
-        # Schedule the generation in the event loop
-        asyncio.create_task(self.generate_for_enrollment(payload))
+        # Schedule the generation in the event loop, retaining a reference so
+        # the task can't be garbage-collected before it completes.
+        task = asyncio.create_task(self.generate_for_enrollment(payload))
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
         print(f"Auto-generating drafts for cadence instance {payload}")
+
+    def listener_status(self) -> dict:
+        """Report current listener liveness for health checks."""
+        last_connected = None
+        if self.listener_last_connected_at is not None:
+            last_connected = (
+                datetime.utcfromtimestamp(self.listener_last_connected_at).isoformat() + "Z"
+            )
+        return {
+            "connected": self.listener_connected,
+            "last_connected_at": last_connected,
+            "reconnects": self.listener_reconnects,
+            "last_error": self.listener_last_error,
+        }
 
     async def generate_for_enrollment(self, cadence_instance_id: str) -> dict:
         """
@@ -239,6 +320,14 @@ class CadenceDraftGenerator:
 
 # Module-level instance (initialized in FastAPI lifespan)
 _cadence_generator: Optional[CadenceDraftGenerator] = None
+
+
+def listener_health() -> dict:
+    """Listener liveness for the /health endpoint and external monitors."""
+    if _cadence_generator is None:
+        return {"connected": False, "last_connected_at": None,
+                "reconnects": 0, "last_error": "not_initialized"}
+    return _cadence_generator.listener_status()
 
 
 @asynccontextmanager

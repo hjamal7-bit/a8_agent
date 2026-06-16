@@ -184,12 +184,30 @@ echo $A8_DATABASE_URL
 ### Listener Status
 
 ```bash
-# Check if LISTEN/NOTIFY is working
+# Fastest check: /health now reports the enrollment listener. status is
+# "degraded" (not "ok") when the LISTEN connection is down, and the listener
+# block shows reconnect count and last error.
+curl -s http://127.0.0.1:8788/health | jq
+# {
+#   "status": "ok",                # or "degraded" if the listener is down
+#   "service": "a8_agent",
+#   "listener": {"connected": true, "last_connected_at": "...", "reconnects": 0, "last_error": null}
+# }
+
+# Confirm the LISTEN backend is actually live in Postgres
+psql $A8_DATABASE_URL -c \
+  "SELECT pid, state, backend_start FROM pg_stat_activity WHERE query ILIKE '%LISTEN%';"
+
+# Or watch raw notifications directly
 psql $A8_DATABASE_URL << 'EOF'
 LISTEN cadence_enroll;
 -- Wait for notifications or CTRL-C
 EOF
 ```
+
+The listener now auto-reconnects with exponential backoff if the connection
+drops (Postgres restart, idle timeout, host sleep). A rising `reconnects`
+count in `/health` is the signal that the connection is flapping.
 
 ---
 
@@ -328,14 +346,24 @@ EOF
 
 **Fix:**
 ```bash
-# Recreate the trigger
+# Recreate the trigger. NOTE: a trigger must call a no-arg trigger function;
+# `EXECUTE FUNCTION pg_notify('cadence_enroll', NEW.id::text)` is INVALID and
+# will fail (or leave you with no trigger at all). Define a function that calls
+# pg_notify, then attach the trigger to it.
 psql $A8_DATABASE_URL << 'EOF'
+CREATE OR REPLACE FUNCTION notify_cadence_enroll() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify('cadence_enroll', NEW.id::text);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 DROP TRIGGER IF EXISTS cadence_enroll_notify ON cadence_instances;
 
 CREATE TRIGGER cadence_enroll_notify
   AFTER INSERT ON cadence_instances
   FOR EACH ROW
-  EXECUTE FUNCTION pg_notify('cadence_enroll', NEW.id::text);
+  EXECUTE FUNCTION notify_cadence_enroll();
 EOF
 
 # Restart the service

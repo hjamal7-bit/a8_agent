@@ -294,5 +294,88 @@ async def test_metrics_recorded_on_error(mock_db_pool, mock_cadence_instance, mo
     assert metrics_collector.drafts_failed_total == 1
 
 
+@pytest.mark.asyncio
+async def test_listener_status_initial():
+    """Listener status reports disconnected before any connection is made."""
+    generator = CadenceDraftGenerator("postgresql://test")
+
+    status = generator.listener_status()
+
+    assert status["connected"] is False
+    assert status["last_connected_at"] is None
+    assert status["reconnects"] == 0
+
+
+@pytest.mark.asyncio
+async def test_listener_reconnects_after_drop():
+    """
+    The listener loop re-establishes the LISTEN after a dropped connection
+    instead of exiting (the original outage cause). We force the first connect
+    attempt to fail, then succeed, and assert it recovers and marks connected.
+    """
+    generator = CadenceDraftGenerator("postgresql://test")
+    generator._RECONNECT_BASE_DELAY = 0  # no real backoff sleep in tests
+
+    # A connection that stays "open" so the heartbeat loop parks on sleep.
+    good_conn = AsyncMock()
+    good_conn.is_closed = lambda: False
+    good_conn.add_listener = AsyncMock()
+
+    connect_calls = {"n": 0}
+
+    async def fake_connect(url):
+        connect_calls["n"] += 1
+        if connect_calls["n"] == 1:
+            raise ConnectionError("connection refused")  # first attempt fails
+        return good_conn  # reconnect succeeds
+
+    with patch("a8_agent.cadence_draft_handler.asyncpg.connect", side_effect=fake_connect):
+        task = asyncio.create_task(generator._start_listener())
+        # Let the loop fail once, back off (0s), then connect successfully.
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if generator.listener_connected:
+                break
+
+    assert generator.listener_connected is True
+    assert generator.listener_reconnects == 1
+    assert good_conn.add_listener.await_count == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_enroll_callback_retains_task_reference():
+    """
+    _on_cadence_enroll must hold a reference to the spawned generation task so
+    it isn't garbage-collected mid-run, and must drop it once done.
+    """
+    generator = CadenceDraftGenerator("postgresql://test")
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_generate(payload):
+        started.set()
+        await release.wait()
+        return {"generated": [], "skipped": 0, "error": None}
+
+    generator.generate_for_enrollment = fake_generate
+
+    generator._on_cadence_enroll(None, 1234, "cadence_enroll", "inst-123")
+
+    await started.wait()
+    assert len(generator._pending_tasks) == 1  # reference retained while running
+
+    release.set()
+    await asyncio.sleep(0)  # let the done-callback fire
+    await asyncio.sleep(0)
+    assert len(generator._pending_tasks) == 0  # cleaned up after completion
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
